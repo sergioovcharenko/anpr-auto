@@ -22,6 +22,14 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME"
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
+      - name: Download the offline European plate detector
+        run: |
+          mkdir -p app/src/main/assets
+          curl -fL --retry 3 --connect-timeout 20 --max-time 180 \
+            "https://huggingface.co/0xnu/european-license-plate-recognition/resolve/main/model.onnx?download=true" \
+            -o app/src/main/assets/plate-europe.onnx
+          test "$(wc -c < app/src/main/assets/plate-europe.onnx)" -gt 1000000
+          ls -lh app/src/main/assets/plate-europe.onnx
       - name: Build debug APK
         run: gradle --no-daemon assembleDebug
       - name: Upload APK
