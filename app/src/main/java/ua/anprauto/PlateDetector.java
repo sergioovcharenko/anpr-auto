@@ -21,6 +21,8 @@ public final class PlateDetector implements AutoCloseable {
     private final OrtEnvironment env;
     private final OrtSession session;
     private final String inputName;
+    private OrtSession uaSession;
+    private String uaInput;
     private final int[] pixels = new int[SIZE*SIZE];
     private final float[] data = new float[SIZE*SIZE*3];
     private boolean warned=false;
@@ -38,7 +40,20 @@ public final class PlateDetector implements AutoCloseable {
         opts.setIntraOpNumThreads(2);
         session=env.createSession(file.getAbsolutePath(),opts);
         inputName=session.getInputNames().iterator().next();
-        Log.i("ANPR","ONNX model loaded: "+file.length()+" bytes");
+        Log.i("ANPR","European ONNX model loaded: "+file.length()+" bytes");
+        try{
+            File ukrainian=new File(context.getFilesDir(),"plate-ukraine.onnx");
+            if(!ukrainian.exists()){
+                try(InputStream in=context.getAssets().open("plate-ukraine.onnx");
+                    FileOutputStream out=new FileOutputStream(ukrainian)){
+                    byte[] buf=new byte[65536];int n;
+                    while((n=in.read(buf))!=-1)out.write(buf,0,n);
+                }
+            }
+            uaSession=env.createSession(ukrainian.getAbsolutePath(),opts);
+            uaInput=uaSession.getInputNames().iterator().next();
+            Log.i("ANPR","Ukrainian ONNX model loaded: "+ukrainian.length()+" bytes");
+        }catch(Exception e){Log.w("ANPR","Ukrainian model unavailable; using EU detector",e);}
     }
     public synchronized Rect detect(Bitmap source){
         if(source==null)return null;
@@ -51,8 +66,24 @@ public final class PlateDetector implements AutoCloseable {
             data[i+SIZE*SIZE]=((p>>8)&255)/255f;
             data[i+2*SIZE*SIZE]=(p&255)/255f;
         }
-        try(OnnxTensor tensor=OnnxTensor.createTensor(env,FloatBuffer.wrap(data),new long[]{1,3,SIZE,SIZE});
-            OrtSession.Result result=session.run(Collections.singletonMap(inputName,tensor))){
+        try(OnnxTensor tensor=OnnxTensor.createTensor(env,FloatBuffer.wrap(data),new long[]{1,3,SIZE,SIZE})){
+            Rect european=null,ukrainian=null;
+            try(OrtSession.Result result=session.run(Collections.singletonMap(inputName,tensor))){
+                european=selectBox(result,source);
+            }
+            if(european!=null)return european;
+            if(uaSession!=null){
+                try(OrtSession.Result result=uaSession.run(Collections.singletonMap(uaInput,tensor))){
+                    ukrainian=selectBox(result,source);
+                }
+            }
+            return ukrainian;
+        }catch(Exception e){
+            if(!warned){Log.e("ANPR","Detector runtime failed",e);warned=true;}
+            return null;
+        }
+    }
+    private Rect selectBox(OrtSession.Result result, Bitmap source){
             Object raw=result.get(0).getValue();
             if(!(raw instanceof float[][][]))return null;
             float[][][] out=(float[][][])raw;
@@ -82,10 +113,6 @@ public final class PlateDetector implements AutoCloseable {
             int bottom=Math.min(source.getHeight(),Math.round((y+h/2)*sy));
             if(right-left<16||bottom-top<8)return null;
             return new Rect(left,top,right,bottom);
-        }catch(Exception e){
-            if(!warned){Log.e("ANPR","Detector runtime failed",e);warned=true;}
-            return null;
-        }
     }
-    @Override public void close(){try{session.close();}catch(Exception ignored){}}
+    @Override public void close(){try{session.close();if(uaSession!=null)uaSession.close();}catch(Exception ignored){}}
 }
