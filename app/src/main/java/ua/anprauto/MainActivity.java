@@ -5,6 +5,12 @@ import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.BitmapFactory;
+import android.graphics.Matrix;
+import android.graphics.Typeface;
+import android.util.Size;
+import androidx.camera.core.resolutionselector.ResolutionSelector;
+import androidx.camera.core.resolutionselector.ResolutionStrategy;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
@@ -54,6 +60,9 @@ public class MainActivity extends ComponentActivity {
     private PreviewView preview;
     private BoxOverlay overlay;
     private TextView status;
+    private TextView captureIndicator;
+    private Rect lastPlateBox;
+    private int lastImageWidth=0,lastImageHeight=0;
     private ImageView snapshot;
     private FrameLayout root;
     private ImageCapture imageCapture;
@@ -84,6 +93,13 @@ public class MainActivity extends ComponentActivity {
         status.setTextSize(19);
         status.setText("ANPR AUTO · OFFLINE OCR\nОчікування камери...");
         bar.addView(status);
+        captureIndicator=new TextView(this);
+        captureIndicator.setText("● ГОТОВО ДО ФОТО");
+        captureIndicator.setTextColor(0xFF94A3B8);
+        captureIndicator.setTextSize(22);
+        captureIndicator.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
+        captureIndicator.setPadding(2,12,2,10);
+        bar.addView(captureIndicator);
         TextView details = new TextView(this);
         details.setText("Зелена: повний номер · жовта: частковий · червона: нечіткий\nФото HIGH · пауза 1 с · антидубль 30 с");
         details.setTextSize(12);
@@ -113,9 +129,14 @@ public class MainActivity extends ComponentActivity {
         future.addListener(()->{
             try {
                 ProcessCameraProvider provider=future.get();
-                Preview p = new Preview.Builder().build();
+                ResolutionSelector previewResolution=new ResolutionSelector.Builder().setResolutionStrategy(
+                  new ResolutionStrategy(new Size(1920,1080),ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build();
+                ResolutionSelector photoResolution=new ResolutionSelector.Builder().setResolutionStrategy(
+                  new ResolutionStrategy(new Size(4000,3000),ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build();
+                Preview p = new Preview.Builder().setResolutionSelector(previewResolution).build();
                 p.setSurfaceProvider(preview.getSurfaceProvider());
-                imageCapture = new ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY).build();
+                imageCapture = new ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                        .setJpegQuality(98).setResolutionSelector(photoResolution).build();
                 ImageAnalysis analysis=new ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build();
                 analysis.setAnalyzer(io,this::analyse);
                 provider.unbindAll();
@@ -161,6 +182,7 @@ public class MainActivity extends ComponentActivity {
                 final int width=input.getWidth(),height=input.getHeight();
                 main.post(()->{
                     overlay.update(rect,tint,width,height);
+                    if(rect!=null && !value.isEmpty()) {lastPlateBox=new Rect(rect);lastImageWidth=width;lastImageHeight=height;}
                     if(rect==null){status.setText("ANPR AUTO · OFFLINE OCR\nПошук номерів...");}
                     else if(value.isEmpty()){status.setText("ANPR AUTO · НЕЧІТКО\nПовторна спроба...");}
                     else status.setText("ANPR AUTO · "+(tint==Color.GREEN?"ЗНАЙДЕНО":"ЧАСТКОВО")+"\n"+value);
@@ -182,13 +204,25 @@ public class MainActivity extends ComponentActivity {
     private void savePhoto(String plate,int tint){
         if(imageCapture==null)return;
         saving=true;
+        captureIndicator.setText("● ФОТО ЗРОБЛЕНО: "+plate);
+        captureIndicator.setTextColor(tint);
+        captureIndicator.setBackgroundColor(0xDD101820);
+        main.postDelayed(()->{captureIndicator.setText("● ГОТОВО ДО ФОТО");captureIndicator.setTextColor(0xFF94A3B8);},1000);
         File folder=new File(getExternalFilesDir(Environment.DIRECTORY_PICTURES),"ANPR");
         if(!folder.exists()&&!folder.mkdirs()){saving=false;return;}
         String stamp=new SimpleDateFormat("yyyyMMdd_HHmmss_SSS",Locale.ROOT).format(new Date());
         File target=new File(folder,stamp+"_"+plate+".jpg");
         Bitmap frame=preview.getBitmap();
         if(frame!=null){
-            snapshot.setImageBitmap(frame);
+            Bitmap shot=frame.copy(Bitmap.Config.ARGB_8888,true);
+            Canvas shotCanvas=new Canvas(shot);
+            Paint platePaint=new Paint(3);
+            platePaint.setColor(tint);
+            platePaint.setTextSize(Math.max(36f,shot.getWidth()/24f));
+            platePaint.setTypeface(Typeface.DEFAULT_BOLD);
+            platePaint.setShadowLayer(4,1,1,Color.BLACK);
+            shotCanvas.drawText("● ФОТО: "+plate,24,Math.max(70,shot.getHeight()/12f),platePaint);
+            snapshot.setImageBitmap(shot);
             snapshot.setVisibility(View.VISIBLE);
             main.postDelayed(()->{snapshot.setVisibility(View.GONE);snapshot.setImageDrawable(null);},1000);
         }
@@ -196,12 +230,33 @@ public class MainActivity extends ComponentActivity {
             io,new ImageCapture.OnImageSavedCallback(){
                 @Override public void onImageSaved(@NonNull ImageCapture.OutputFileResults output){
                     saving=false;
+                    io.execute(()->annotatePhoto(target,plate,tint));
                     main.post(()->Toast.makeText(MainActivity.this,"Фото збережено: "+plate,Toast.LENGTH_SHORT).show());
                 }
                 @Override public void onError(@NonNull androidx.camera.core.ImageCaptureException e){
                     saving=false;main.post(()->status.setText("Помилка запису: "+e.getMessage()));
                 }
             });
+    }
+    /** Overlay the recorded number on the original full-resolution image, not the low-res camera preview. */
+    private void annotatePhoto(File target,String plate,int tint){
+        try{
+            android.graphics.BitmapFactory.Options options=new android.graphics.BitmapFactory.Options();
+            options.inPreferredConfig=Bitmap.Config.ARGB_8888;
+            Bitmap source=BitmapFactory.decodeFile(target.getAbsolutePath(),options);
+            if(source==null)return;
+            Bitmap edited=source.copy(Bitmap.Config.ARGB_8888,true);
+            Canvas c=new Canvas(edited);
+            float scale=Math.max(1f,edited.getWidth()/1080f);
+            Paint background=new Paint(3);background.setColor(0xD9000000);
+            c.drawRoundRect(new RectF(24*scale,24*scale,Math.min(edited.getWidth()-12*scale,770*scale),135*scale),12*scale,12*scale,background);
+            Paint text=new Paint(3);text.setColor(tint);text.setTypeface(Typeface.DEFAULT_BOLD);text.setTextSize(48*scale);
+            c.drawText("● "+plate,45*scale,94*scale,text);
+            try(java.io.FileOutputStream stream=new java.io.FileOutputStream(target)){
+                edited.compress(Bitmap.CompressFormat.JPEG,98,stream);
+            }
+            source.recycle();edited.recycle();
+        }catch(Exception e){android.util.Log.w("ANPR","Photo label failed",e);}
     }
     @Override public void onDestroy(){
         recognizer.close();io.shutdown();super.onDestroy();
