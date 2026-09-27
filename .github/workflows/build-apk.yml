@@ -30,6 +30,13 @@ jobs:
             -o app/src/main/assets/plate-europe.onnx
           test "$(wc -c < app/src/main/assets/plate-europe.onnx)" -gt 1000000
           ls -lh app/src/main/assets/plate-europe.onnx
+      - name: Download Ukrainian plate detector
+        run: |
+          curl -fL --retry 3 --connect-timeout 20 --max-time 180 \
+            "https://huggingface.co/Murd0ck/LicensePlateDetector_YOLOv8n/resolve/main/best.onnx?download=true" \
+            -o app/src/main/assets/plate-ukraine.onnx
+          test "$(wc -c < app/src/main/assets/plate-ukraine.onnx)" -gt 1000000
+          ls -lh app/src/main/assets/plate-ukraine.onnx
       - name: Build debug APK
         run: gradle --no-daemon assembleDebug
       - name: Upload APK
