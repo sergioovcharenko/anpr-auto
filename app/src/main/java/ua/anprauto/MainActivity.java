@@ -6,6 +6,8 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.BitmapFactory;
+import android.provider.MediaStore;
+import android.content.ContentValues;
 import android.graphics.ImageFormat;
 import android.graphics.YuvImage;
 import android.graphics.Matrix;
@@ -276,7 +278,7 @@ public class MainActivity extends ComponentActivity {
     private void savePhoto(String plate,int tint){
         if(imageCapture==null)return;
         saving=true;
-        captureIndicator.setText("● ФОТО ЗРОБЛЕНО: "+plate);
+        captureIndicator.setText("● ФОТОГРАФУВАННЯ: "+plate);
         captureIndicator.setTextColor(tint);
         captureIndicator.setBackgroundColor(0xDD101820);
         main.postDelayed(()->{captureIndicator.setText("● ГОТОВО ДО ФОТО");captureIndicator.setTextColor(0xFF94A3B8);},1000);
@@ -288,11 +290,12 @@ public class MainActivity extends ComponentActivity {
             io,new ImageCapture.OnImageSavedCallback(){
                 @Override public void onImageSaved(@NonNull ImageCapture.OutputFileResults output){
                     saving=false;
+                    main.post(()->{captureIndicator.setText("● ЗБЕРЕЖЕНО: "+plate);captureIndicator.setTextColor(tint);});
                     io.execute(()->annotatePhoto(target,plate,tint));
                     main.post(()->Toast.makeText(MainActivity.this,"Фото збережено: "+plate,Toast.LENGTH_SHORT).show());
                 }
                 @Override public void onError(@NonNull androidx.camera.core.ImageCaptureException e){
-                    saving=false;main.post(()->status.setText("Помилка запису: "+e.getMessage()));
+                    saving=false;main.post(()->{captureIndicator.setText("● ПОМИЛКА ФОТО");captureIndicator.setTextColor(Color.RED);status.setText("Помилка запису: "+e.getMessage());});
                 }
             });
     }
@@ -336,6 +339,7 @@ public class MainActivity extends ComponentActivity {
             try(java.io.FileOutputStream stream=new java.io.FileOutputStream(target)){
                 edited.compress(Bitmap.CompressFormat.JPEG,96,stream);
             }
+            publishToGallery(target);
             Bitmap display=BitmapFactory.decodeFile(target.getAbsolutePath(),new BitmapFactory.Options(){{
                 inSampleSize=2;
             }});
@@ -350,6 +354,26 @@ public class MainActivity extends ComponentActivity {
             if(rotated!=null&&rotated!=source&&!rotated.isRecycled())rotated.recycle();
             if(source!=null&&!source.isRecycled())source.recycle();
         }
+    }
+    /** Publish annotated JPEG in Android's visible gallery, without exposing the raw backup. */
+    private void publishToGallery(File image){
+        try{
+            ContentValues values=new ContentValues();
+            values.put(MediaStore.Images.Media.DISPLAY_NAME,image.getName());
+            values.put(MediaStore.Images.Media.MIME_TYPE,"image/jpeg");
+            values.put(MediaStore.Images.Media.RELATIVE_PATH,Environment.DIRECTORY_PICTURES+"/ANPR AUTO");
+            values.put(MediaStore.Images.Media.IS_PENDING,1);
+            android.net.Uri uri=getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,values);
+            if(uri==null)return;
+            try(java.io.InputStream in=new java.io.FileInputStream(image);
+                java.io.OutputStream out=getContentResolver().openOutputStream(uri)){
+                if(out==null)return;
+                byte[] buffer=new byte[65536];int n;
+                while((n=in.read(buffer))!=-1)out.write(buffer,0,n);
+            }
+            values.clear();values.put(MediaStore.Images.Media.IS_PENDING,0);
+            getContentResolver().update(uri,values,null,null);
+        }catch(Exception e){android.util.Log.e("ANPR","Gallery export failed",e);}
     }
     @Override public void onDestroy(){
         if(detector!=null)detector.close();
@@ -367,7 +391,7 @@ public class MainActivity extends ComponentActivity {
             super.onDraw(c);
             if(box==null)return;
             // InputImage coordinates are rotation-adjusted. PreviewView uses FILL_CENTER.
-            float scale=Math.max(getWidth()/(float)sourceWidth,getHeight()/(float)sourceHeight);
+            float scale=Math.min(getWidth()/(float)sourceWidth,getHeight()/(float)sourceHeight);
             float dx=(getWidth()-sourceWidth*scale)/2f,dy=(getHeight()-sourceHeight*scale)/2f;
             RectF b=new RectF(dx+box.left*scale,dy+box.top*scale,dx+box.right*scale,dy+box.bottom*scale);
             border.setColor(shade);c.drawRoundRect(b,9,9,border);
