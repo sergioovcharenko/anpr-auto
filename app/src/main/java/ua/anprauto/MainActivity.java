@@ -6,14 +6,7 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.BitmapFactory;
-import android.provider.MediaStore;
-import android.content.ContentValues;
-import android.graphics.ImageFormat;
-import android.graphics.YuvImage;
-import android.graphics.Matrix;
-import android.os.SystemClock;
 import androidx.exifinterface.media.ExifInterface;
-import java.io.ByteArrayOutputStream;
 import android.graphics.Matrix;
 import android.graphics.Typeface;
 import android.util.Size;
@@ -75,11 +68,6 @@ public class MainActivity extends ComponentActivity {
     private FrameLayout root;
     private ImageCapture imageCapture;
     private com.google.mlkit.vision.text.TextRecognizer recognizer;
-    private PlateDetector detector;
-    private volatile long lastAnalyzed=0;
-    private String candidate="";
-    private int candidateCount=0;
-    private java.util.Map<String,Long> savedNumbers = new java.util.HashMap<>();
     private volatile boolean processing = false;
     private volatile boolean saving = false;
     private String previousPlate = "";
@@ -141,7 +129,6 @@ public class MainActivity extends ComponentActivity {
         ListenableFuture<ProcessCameraProvider> future=ProcessCameraProvider.getInstance(this);
         future.addListener(()->{
             try {
-                if(detector==null)detector=new PlateDetector(this);
                 ProcessCameraProvider provider=future.get();
                 ResolutionSelector previewResolution=new ResolutionSelector.Builder().setResolutionStrategy(
                   new ResolutionStrategy(new Size(1920,1080),ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build();
@@ -151,11 +138,7 @@ public class MainActivity extends ComponentActivity {
                 p.setSurfaceProvider(preview.getSurfaceProvider());
                 imageCapture = new ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
                         .setJpegQuality(98).setResolutionSelector(photoResolution).build();
-                ImageAnalysis analysis=new ImageAnalysis.Builder()
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setResolutionSelector(new ResolutionSelector.Builder().setResolutionStrategy(
-                        new ResolutionStrategy(new Size(1280,720),ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build())
-                    .build();
+                ImageAnalysis analysis=new ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build();
                 analysis.setAnalyzer(io,this::analyse);
                 provider.unbindAll();
                 provider.bindToLifecycle(this,CameraSelector.DEFAULT_BACK_CAMERA,p,analysis,imageCapture);
@@ -163,114 +146,54 @@ public class MainActivity extends ComponentActivity {
             } catch(Exception e){status.setText("Помилка камери: "+e.getMessage());}
         },ContextCompat.getMainExecutor(this));
     }
-    // CameraX still images are captured separately at sensor resolution, not from the preview Bitmap.
     private void analyse(@NonNull ImageProxy image){
-        long now=SystemClock.uptimeMillis();
-        if(processing||now-lastAnalyzed<220){image.close();return;}
-        processing=true;lastAnalyzed=now;
-        Bitmap frame;
-        try{frame=toBitmap(image);}catch(Exception e){image.close();processing=false;return;}
-        image.close();
-        if(frame==null){processing=false;return;}
-        Rect plate=detector!=null?detector.detect(frame):null;
-        if(plate==null){
-            main.post(()->{overlay.update(null,Color.RED,frame.getWidth(),frame.getHeight());
-                status.setText("ANPR AUTO · OFFLINE AI\\nПошук номерів...");});
-            frame.recycle();processing=false;return;
-        }
-        int padX=Math.max(4,plate.width()/10),padY=Math.max(3,plate.height()/5);
-        Rect cropBox=new Rect(Math.max(0,plate.left-padX),Math.max(0,plate.top-padY),
-                Math.min(frame.getWidth(),plate.right+padX),Math.min(frame.getHeight(),plate.bottom+padY));
-        Bitmap crop=Bitmap.createBitmap(frame,cropBox.left,cropBox.top,cropBox.width(),cropBox.height());
-        int sharpness=sharpness(crop);
-        final int frameW=frame.getWidth(),frameH=frame.getHeight();
-        frame.recycle();
-        InputImage input=InputImage.fromBitmap(crop,0);
-        recognizer.process(input).addOnSuccessListener(result->{
-            String best="";
-            // OCR may split number into multiple lines on two-row EU plates.
-            for(Text.TextBlock b:result.getTextBlocks()){
-                String joined=normalize(b.getText());
-                if(joined.length()>best.length()&&joined.length()<=12)best=joined;
-                for(Text.Line l:b.getLines()){
-                    String candidate=normalize(l.getText());
-                    if(candidate.length()>best.length()&&candidate.length()<=12)best=candidate;
-                }
-            }
-            String value=best;
-            boolean plausible=value.length()>=6&&value.length()<=10&&countDigits(value)>=2
-                    &&value.matches("[A-Z0-9]+")&&countLetters(value)>=1;
-            if(value.equals(this.candidate)&&plausible)candidateCount++;
-            else{this.candidate=value;candidateCount=1;}
-            int color=plausible&&candidateCount>=2&&sharpness>=35?Color.GREEN:
-                (!value.isEmpty()&&sharpness>=15?Color.YELLOW:Color.RED);
-            main.post(()->{
-                overlay.update(plate,color,frameW,frameH);
-                if(color==Color.GREEN)status.setText("ANPR AUTO · ЗНАЙДЕНО\\n"+value);
-                else if(color==Color.YELLOW)status.setText("ANPR AUTO · ЧАСТКОВО\\n"+value);
-                else status.setText("ANPR AUTO · РОЗМИТО\\nШукаємо чіткіший кадр...");
-                if(color!=Color.RED&&!saving){
-                    long time=System.currentTimeMillis();
-                    Long last=savedNumbers.get(value);
-                    if(last==null||time-last>=30000){
-                        savedNumbers.put(value,time);
-                        lastPlateBox=new Rect(plate);lastImageWidth=frameW;lastImageHeight=frameH;
-                        savePhoto(value,color);
+        if(processing){image.close();return;}
+        android.media.Image media=image.getImage();
+        if(media==null){image.close();return;}
+        processing=true;
+        try {
+            InputImage input=InputImage.fromMediaImage(media,image.getImageInfo().getRotationDegrees());
+            recognizer.process(input).addOnSuccessListener(result->{
+                String found="";
+                Rect box=null;
+                int color=Color.RED;
+                String partial="";
+                Rect partialBox=null;
+                for(Text.TextBlock block:result.getTextBlocks()){
+                    for(Text.Line line:block.getLines()){
+                        String clean=normalize(line.getText());
+                        if(fullPlate.matcher(clean).matches()){
+                            found=clean;box=line.getBoundingBox();color=Color.GREEN;break;
+                        }
+                        if(clean.length()>=4 && clean.length()<=10 && clean.matches("[A-Z0-9]+") && countDigits(clean)>=2){
+                            if(clean.length()>partial.length()){partial=clean;partialBox=line.getBoundingBox();}
+                        }
                     }
+                    if(!found.isEmpty())break;
                 }
-            });
-        }).addOnFailureListener(e->main.post(()->status.setText("Помилка OCR: "+e.getMessage())))
-          .addOnCompleteListener(task->{crop.recycle();processing=false;});
+                if(found.isEmpty() && !partial.isEmpty()){found=partial;box=partialBox;color=Color.YELLOW;}
+                // Never mark arbitrary scene text or sky as a detected plate.
+                final String value=found;
+                final Rect rect=box;
+                final int tint=color;
+                final int width=input.getWidth(),height=input.getHeight();
+                main.post(()->{
+                    overlay.update(rect,tint,width,height);
+                    if(rect!=null && !value.isEmpty()) {lastPlateBox=new Rect(rect);lastImageWidth=width;lastImageHeight=height;}
+                    if(rect==null){status.setText("ANPR AUTO · OFFLINE OCR\nПошук номерів...");}
+                    else if(value.isEmpty()){status.setText("ANPR AUTO · НЕЧІТКО\nПовторна спроба...");}
+                    else status.setText("ANPR AUTO · "+(tint==Color.GREEN?"ЗНАЙДЕНО":"ЧАСТКОВО")+"\n"+value);
+                    if(!value.isEmpty() && !saving && (tint==Color.GREEN||tint==Color.YELLOW)){
+                        long now=System.currentTimeMillis();
+                        if(!value.equals(previousPlate) || now-previousShot>=30000){
+                            previousPlate=value;previousShot=now;savePhoto(value,tint);
+                        }
+                    }
+                });
+            }).addOnFailureListener(e->main.post(()->status.setText("Помилка OCR: "+e.getMessage())))
+              .addOnCompleteListener(task->{processing=false;image.close();});
+        }catch(Exception e){processing=false;image.close();}
     }
-    /** Convert camera YUV_420_888 safely with row/pixel stride and rotate to screen orientation. */
-    private Bitmap toBitmap(ImageProxy image) throws Exception {
-        int width=image.getWidth(),height=image.getHeight();
-        byte[] nv21=new byte[width*height*3/2];
-        ImageProxy.PlaneProxy[] planes=image.getPlanes();
-        java.nio.ByteBuffer y=planes[0].getBuffer(),u=planes[1].getBuffer(),v=planes[2].getBuffer();
-        for(int row=0;row<height;row++){
-            int at=row*planes[0].getRowStride();
-            for(int col=0;col<width;col++)nv21[row*width+col]=y.get(at+col*planes[0].getPixelStride());
-        }
-        int chromaOffset=width*height;
-        for(int row=0;row<height/2;row++){
-            for(int col=0;col<width/2;col++){
-                int uv=chromaOffset+row*width+col*2;
-                nv21[uv]=v.get(row*planes[2].getRowStride()+col*planes[2].getPixelStride());
-                nv21[uv+1]=u.get(row*planes[1].getRowStride()+col*planes[1].getPixelStride());
-            }
-        }
-        YuvImage yuv=new YuvImage(nv21,ImageFormat.NV21,width,height,null);
-        ByteArrayOutputStream output=new ByteArrayOutputStream();
-        yuv.compressToJpeg(new Rect(0,0,width,height),88,output);
-        byte[] jpg=output.toByteArray();
-        Bitmap bitmap=BitmapFactory.decodeByteArray(jpg,0,jpg.length);
-        int rotation=image.getImageInfo().getRotationDegrees();
-        if(rotation!=0){Matrix m=new Matrix();m.postRotate(rotation);
-            Bitmap rotated=Bitmap.createBitmap(bitmap,0,0,bitmap.getWidth(),bitmap.getHeight(),m,true);
-            bitmap.recycle();return rotated;
-        }
-        return bitmap;
-    }
-    /** Fast local blur estimate. Thresholds are initial heuristics to calibrate on real footage. */
-    private int sharpness(Bitmap image) {
-        int w=image.getWidth(),h=image.getHeight();
-        if(w<10||h<10)return 0;
-        Bitmap sample=Bitmap.createScaledBitmap(image,Math.min(192,w),Math.min(64,h),true);
-        int sw=sample.getWidth(),sh=sample.getHeight();
-        int[] px=new int[sw*sh];sample.getPixels(px,0,sw,0,0,sw,sh);
-        long energy=0;int count=0;
-        for(int y=1;y<sh-1;y+=2)for(int x=1;x<sw-1;x+=2){
-            int center=luma(px[y*sw+x]);
-            int edge=Math.abs(4*center-luma(px[y*sw+x-1])-luma(px[y*sw+x+1])
-                    -luma(px[(y-1)*sw+x])-luma(px[(y+1)*sw+x]));
-            energy+=edge;count++;
-        }
-        if(sample!=image)sample.recycle();
-        return count==0?0:(int)Math.min(100,energy/count*2);
-    }
-    private int luma(int p){return (((p>>16)&255)*77+((p>>8)&255)*150+(p&255)*29)>>8;}
-    private int countLetters(String s){int n=0;for(int i=0;i<s.length();i++)if(Character.isLetter(s.charAt(i)))n++;return n;}
     private String normalize(String text){
         return text.toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9]","");
     }
@@ -281,7 +204,7 @@ public class MainActivity extends ComponentActivity {
         captureIndicator.setText("● ФОТОГРАФУВАННЯ: "+plate);
         captureIndicator.setTextColor(tint);
         captureIndicator.setBackgroundColor(0xDD101820);
-        main.postDelayed(()->{captureIndicator.setText("● ГОТОВО ДО ФОТО");captureIndicator.setTextColor(0xFF94A3B8);},1000);
+        main.postDelayed(()->{captureIndicator.setText("● ГОТОВО ДО ФОТО");captureIndicator.setTextColor(0xFF94A3B8);},1800);
         File folder=new File(getExternalFilesDir(Environment.DIRECTORY_PICTURES),"ANPR");
         if(!folder.exists()&&!folder.mkdirs()){saving=false;return;}
         String stamp=new SimpleDateFormat("yyyyMMdd_HHmmss_SSS",Locale.ROOT).format(new Date());
@@ -289,94 +212,62 @@ public class MainActivity extends ComponentActivity {
         imageCapture.takePicture(new ImageCapture.OutputFileOptions.Builder(target).build(),
             io,new ImageCapture.OnImageSavedCallback(){
                 @Override public void onImageSaved(@NonNull ImageCapture.OutputFileResults output){
-                    saving=false;
-                    main.post(()->{captureIndicator.setText("● ЗБЕРЕЖЕНО: "+plate);captureIndicator.setTextColor(tint);});
                     io.execute(()->annotatePhoto(target,plate,tint));
+                    main.post(()->captureIndicator.setText("● ЗБЕРЕЖЕНО: "+plate));
+                    saving=false;
                     main.post(()->Toast.makeText(MainActivity.this,"Фото збережено: "+plate,Toast.LENGTH_SHORT).show());
                 }
                 @Override public void onError(@NonNull androidx.camera.core.ImageCaptureException e){
-                    saving=false;main.post(()->{captureIndicator.setText("● ПОМИЛКА ФОТО");captureIndicator.setTextColor(Color.RED);status.setText("Помилка запису: "+e.getMessage());});
+                    saving=false;main.post(()->status.setText("Помилка запису: "+e.getMessage()));
                 }
             });
     }
-    /** Preserve raw full-resolution JPEG and draw the rectangle on a separately saved corrected image. */
-    private void annotatePhoto(File target,String plate,int tint){
-        Bitmap source=null,rotated=null,edited=null;
+    /** Preserve original sensor JPEG; create an annotated copy and preview from the captured photo. */
+    private void annotatePhoto(File original,String plate,int tint){
+        Bitmap source=null,oriented=null,edited=null;
         try {
-            File original=new File(target.getParentFile(),target.getName().replace(".jpg","-original.jpg"));
-            try(java.io.InputStream in=new java.io.FileInputStream(target);
-                java.io.OutputStream out=new java.io.FileOutputStream(original)){
-                byte[] buffer=new byte[65536];int n;
-                while((n=in.read(buffer))!=-1)out.write(buffer,0,n);
-            }
+            BitmapFactory.Options opts=new BitmapFactory.Options();
+            opts.inPreferredConfig=Bitmap.Config.ARGB_8888;
+            source=BitmapFactory.decodeFile(original.getAbsolutePath(),opts);
+            if(source==null)return;
             int orientation=new ExifInterface(original.getAbsolutePath()).getAttributeInt(
                 ExifInterface.TAG_ORIENTATION,ExifInterface.ORIENTATION_NORMAL);
-            source=BitmapFactory.decodeFile(original.getAbsolutePath());
-            if(source==null)return;
             Matrix matrix=new Matrix();
             if(orientation==ExifInterface.ORIENTATION_ROTATE_90)matrix.postRotate(90);
             else if(orientation==ExifInterface.ORIENTATION_ROTATE_180)matrix.postRotate(180);
             else if(orientation==ExifInterface.ORIENTATION_ROTATE_270)matrix.postRotate(270);
-            if(orientation!=ExifInterface.ORIENTATION_NORMAL){
-                rotated=Bitmap.createBitmap(source,0,0,source.getWidth(),source.getHeight(),matrix,true);
-            } else rotated=source;
-            edited=rotated.copy(Bitmap.Config.ARGB_8888,true);
-            Canvas c=new Canvas(edited);
-            Rect plateBox=detector!=null?detector.detect(edited):null;
-            float scale=Math.max(1,edited.getWidth()/1100f);
+            oriented=orientation==ExifInterface.ORIENTATION_NORMAL?source:
+                Bitmap.createBitmap(source,0,0,source.getWidth(),source.getHeight(),matrix,true);
+            edited=oriented.copy(Bitmap.Config.ARGB_8888,true);
+            Canvas canvas=new Canvas(edited);
             Paint pen=new Paint(3);
-            pen.setColor(tint);
-            pen.setStyle(Paint.Style.STROKE);
-            pen.setStrokeWidth(6*scale);
-            if(plateBox!=null)c.drawRoundRect(new RectF(plateBox),9*scale,9*scale,pen);
-            pen.setStyle(Paint.Style.FILL);
-            Paint panel=new Paint(3);panel.setColor(0xDF061420);
-            float labelWidth=Math.min(edited.getWidth()-20*scale,760*scale);
-            float y=plateBox==null?24*scale:Math.max(24*scale,plateBox.top-110*scale);
-            c.drawRoundRect(new RectF(24*scale,y,labelWidth,y+100*scale),12*scale,12*scale,panel);
-            pen.setTypeface(Typeface.DEFAULT_BOLD);pen.setTextSize(45*scale);
-            c.drawText("● "+plate,45*scale,y+67*scale,pen);
-            try(java.io.FileOutputStream stream=new java.io.FileOutputStream(target)){
-                edited.compress(Bitmap.CompressFormat.JPEG,96,stream);
+            pen.setColor(tint);pen.setTypeface(Typeface.DEFAULT_BOLD);
+            float scale=Math.max(1f,edited.getWidth()/1080f);
+            pen.setTextSize(42*scale);
+            Paint panel=new Paint(3);panel.setColor(0xDD0B1725);
+            canvas.drawRoundRect(new RectF(14*scale,14*scale,Math.min(edited.getWidth()-14*scale,660*scale),110*scale),12*scale,12*scale,panel);
+            canvas.drawText("● "+plate,34*scale,77*scale,pen);
+            File marked=new File(original.getParentFile(),original.getName().replace(".jpg","-marked.jpg"));
+            try(java.io.FileOutputStream out=new java.io.FileOutputStream(marked)){
+                edited.compress(Bitmap.CompressFormat.JPEG,97,out);
             }
-            publishToGallery(target);
-            Bitmap display=BitmapFactory.decodeFile(target.getAbsolutePath(),new BitmapFactory.Options(){{
-                inSampleSize=2;
-            }});
-            if(display!=null)main.post(()->{
-                snapshot.setImageBitmap(display);
-                snapshot.setVisibility(View.VISIBLE);
-                main.postDelayed(()->{snapshot.setVisibility(View.GONE);snapshot.setImageDrawable(null);display.recycle();},1000);
+            BitmapFactory.Options small=new BitmapFactory.Options();
+            small.inSampleSize=4;
+            Bitmap still=BitmapFactory.decodeFile(marked.getAbsolutePath(),small);
+            if(still!=null)main.post(()->{
+                snapshot.setImageBitmap(still);snapshot.setVisibility(View.VISIBLE);
+                main.postDelayed(()->{
+                    snapshot.setVisibility(View.GONE);snapshot.setImageDrawable(null);still.recycle();
+                },1000);
             });
-        }catch(Exception e){android.util.Log.w("ANPR","Photo annotation failed",e);}
-        finally {
-            if(edited!=null&&!edited.isRecycled())edited.recycle();
-            if(rotated!=null&&rotated!=source&&!rotated.isRecycled())rotated.recycle();
-            if(source!=null&&!source.isRecycled())source.recycle();
+        }catch(Exception err){android.util.Log.e("ANPR","Annotation error",err);}
+        finally{
+            if(edited!=null)edited.recycle();
+            if(oriented!=null && oriented!=source)oriented.recycle();
+            if(source!=null)source.recycle();
         }
     }
-    /** Publish annotated JPEG in Android's visible gallery, without exposing the raw backup. */
-    private void publishToGallery(File image){
-        try{
-            ContentValues values=new ContentValues();
-            values.put(MediaStore.Images.Media.DISPLAY_NAME,image.getName());
-            values.put(MediaStore.Images.Media.MIME_TYPE,"image/jpeg");
-            values.put(MediaStore.Images.Media.RELATIVE_PATH,Environment.DIRECTORY_PICTURES+"/ANPR AUTO");
-            values.put(MediaStore.Images.Media.IS_PENDING,1);
-            android.net.Uri uri=getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,values);
-            if(uri==null)return;
-            try(java.io.InputStream in=new java.io.FileInputStream(image);
-                java.io.OutputStream out=getContentResolver().openOutputStream(uri)){
-                if(out==null)return;
-                byte[] buffer=new byte[65536];int n;
-                while((n=in.read(buffer))!=-1)out.write(buffer,0,n);
-            }
-            values.clear();values.put(MediaStore.Images.Media.IS_PENDING,0);
-            getContentResolver().update(uri,values,null,null);
-        }catch(Exception e){android.util.Log.e("ANPR","Gallery export failed",e);}
-    }
     @Override public void onDestroy(){
-        if(detector!=null)detector.close();
         recognizer.close();io.shutdown();super.onDestroy();
     }
     private final class BoxOverlay extends View{
