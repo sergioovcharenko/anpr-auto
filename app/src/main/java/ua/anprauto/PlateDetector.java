@@ -83,7 +83,7 @@ public final class PlateDetector implements AutoCloseable {
             return null;
         }
     }
-    private Rect selectBox(OrtSession.Result result, Bitmap source){
+    private Rect selectBox(OrtSession.Result result, Bitmap source) throws Exception{
             Object raw=result.get(0).getValue();
             if(!(raw instanceof float[][][]))return null;
             float[][][] out=(float[][][])raw;
