@@ -8,6 +8,13 @@ import android.graphics.Color;
 import android.graphics.BitmapFactory;
 import androidx.exifinterface.media.ExifInterface;
 import android.graphics.Matrix;
+import android.hardware.camera2.CaptureRequest;
+import androidx.camera.camera2.interop.Camera2Interop;
+import android.widget.Button;
+import android.widget.HorizontalScrollView;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import android.graphics.Typeface;
 import android.util.Size;
 import androidx.camera.core.resolutionselector.ResolutionSelector;
@@ -73,6 +80,12 @@ public class MainActivity extends ComponentActivity {
     private String previousPlate = "";
     private long previousShot = 0;
     private boolean started = false;
+    private volatile int aiMode=0; // 0 legacy OCR, 1 YOLO visual-only, 2 YOLO + OCR
+    private boolean highQuality=true;
+    private OfflinePlateDetector detector;
+    private Button ocrButton,yoloButton,bothButton,qualityButton;
+    private volatile long lastAiFrame=0;
+    private final java.util.Map<String,Long> recent=new java.util.HashMap<>();
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -105,7 +118,24 @@ public class MainActivity extends ComponentActivity {
         details.setText("Зелена: повний номер · жовта: частковий · червона: нечіткий\nФото HIGH · пауза 1 с · антидубль 30 с");
         details.setTextSize(12);
         details.setTextColor(0xFFB9C9D9);
+        details.setText("ТЕСТ: порівняй якість та швидкість у трьох режимах");
         bar.addView(details);
+        HorizontalScrollView scrolling=new HorizontalScrollView(this);
+        scrolling.setHorizontalScrollBarEnabled(false);
+        LinearLayout actions=new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        ocrButton=makeButton("OCR",()->setMode(0));
+        yoloButton=makeButton("YOLO",()->setMode(1));
+        bothButton=makeButton("РАЗОМ",()->setMode(2));
+        qualityButton=makeButton("КАМЕРА: HIGH",()->{
+            highQuality=!highQuality;
+            qualityButton.setText(highQuality?"КАМЕРА: HIGH":"КАМЕРА: ECO");
+            started=false;startCamera();
+        });
+        actions.addView(ocrButton);actions.addView(yoloButton);actions.addView(bothButton);actions.addView(qualityButton);
+        scrolling.addView(actions);
+        bar.addView(scrolling);
+        refreshButtons();
         FrameLayout.LayoutParams top = new FrameLayout.LayoutParams(-1,-2,Gravity.TOP);
         root.addView(bar, top);
         snapshot = new ImageView(this);
@@ -117,6 +147,31 @@ public class MainActivity extends ComponentActivity {
         setContentView(root);
         if(ContextCompat.checkSelfPermission(this,Manifest.permission.CAMERA)==PackageManager.PERMISSION_GRANTED) startCamera();
         else requestPermissions(new String[]{Manifest.permission.CAMERA},CAMERA_PERMISSION);
+    }
+    private Button makeButton(String label,Runnable action){
+        Button b=new Button(this);
+        b.setAllCaps(false);
+        b.setText(label);b.setTextSize(13);
+        b.setOnClickListener(v->action.run());
+        return b;
+    }
+    private void setMode(int value){
+        aiMode=value;refreshButtons();overlay.update(null,Color.GREEN,1,1);
+        if(value!=0 && detector==null)io.execute(()->{
+            detector=new OfflinePlateDetector(getApplicationContext());
+            main.post(()->{
+                if(detector!=null&&!detector.available())status.setText("YOLO недоступний: перевірте модель");
+                else status.setText(value==1?"YOLO: показуємо всі номери":"YOLO + OCR: розпізнаємо всі номери");
+            });
+        });
+        else status.setText(value==0?"OCR: попередній режим":value==1?"YOLO: рамки без OCR":"YOLO + OCR: кілька номерів");
+    }
+    private void refreshButtons(){
+        Button[] all={ocrButton,yoloButton,bothButton};
+        for(int i=0;i<all.length;i++){
+            all[i].setEnabled(i!=aiMode);
+            all[i].setAlpha(i==aiMode?1f:.65f);
+        }
     }
     @Override public void onRequestPermissionsResult(int request,@NonNull String[] permissions,@NonNull int[] results) {
         super.onRequestPermissionsResult(request,permissions,results);
@@ -131,14 +186,24 @@ public class MainActivity extends ComponentActivity {
             try {
                 ProcessCameraProvider provider=future.get();
                 ResolutionSelector previewResolution=new ResolutionSelector.Builder().setResolutionStrategy(
-                  new ResolutionStrategy(new Size(1920,1080),ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build();
+                    new ResolutionStrategy(highQuality?new Size(1920,1080):new Size(1280,720),
+                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build();
                 ResolutionSelector photoResolution=new ResolutionSelector.Builder().setResolutionStrategy(
-                  new ResolutionStrategy(new Size(4000,3000),ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build();
-                Preview p = new Preview.Builder().setResolutionSelector(previewResolution).build();
+                    new ResolutionStrategy(highQuality?new Size(4000,3000):new Size(1920,1080),
+                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build();
+                Preview.Builder pb=new Preview.Builder().setResolutionSelector(previewResolution);
+                new Camera2Interop.Extender<>(pb).setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AF_MODE,CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+                Preview p=pb.build();
                 p.setSurfaceProvider(preview.getSurfaceProvider());
-                imageCapture = new ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
-                        .setJpegQuality(98).setResolutionSelector(photoResolution).build();
-                ImageAnalysis analysis=new ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build();
+                imageCapture=new ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                    .setJpegQuality(98).setResolutionSelector(photoResolution).build();
+                ImageAnalysis analysis=new ImageAnalysis.Builder()
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .setResolutionSelector(new ResolutionSelector.Builder().setResolutionStrategy(
+                        new ResolutionStrategy(highQuality?new Size(1280,720):new Size(960,540),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)).build())
+                    .build();
                 analysis.setAnalyzer(io,this::analyse);
                 provider.unbindAll();
                 provider.bindToLifecycle(this,CameraSelector.DEFAULT_BACK_CAMERA,p,analysis,imageCapture);
@@ -147,6 +212,7 @@ public class MainActivity extends ComponentActivity {
         },ContextCompat.getMainExecutor(this));
     }
     private void analyse(@NonNull ImageProxy image){
+        if(aiMode!=0){analyseYolo(image);return;}
         if(processing){image.close();return;}
         android.media.Image media=image.getImage();
         if(media==null){image.close();return;}
@@ -193,6 +259,93 @@ public class MainActivity extends ComponentActivity {
             }).addOnFailureListener(e->main.post(()->status.setText("Помилка OCR: "+e.getMessage())))
               .addOnCompleteListener(task->{processing=false;image.close();});
         }catch(Exception e){processing=false;image.close();}
+    }
+    /** YOLO runs on a separate sampled bitmap; ImageProxy closes before asynchronous OCR. */
+    private void analyseYolo(@NonNull ImageProxy image){
+        if(processing||detector==null||!detector.available()||
+                android.os.SystemClock.uptimeMillis()-lastAiFrame<(highQuality?240:430)){
+            image.close();return;
+        }
+        processing=true;lastAiFrame=android.os.SystemClock.uptimeMillis();
+        int requestedMode=aiMode;
+        Bitmap source=null;
+        try{
+            source=image.toBitmap();
+            int degrees=image.getImageInfo().getRotationDegrees();
+            if(degrees!=0){
+                Matrix rotation=new Matrix();rotation.postRotate(degrees);
+                Bitmap rotated=Bitmap.createBitmap(source,0,0,source.getWidth(),source.getHeight(),rotation,true);
+                source.recycle();source=rotated;
+            }
+        }catch(Exception ex){
+            android.util.Log.e("ANPR_AI","Camera bitmap conversion",ex);
+            image.close();processing=false;return;
+        }
+        image.close();
+        Bitmap frame=source;
+        try{
+            List<OfflinePlateDetector.Hit> hits=detector.detect(frame);
+            final int w=frame.getWidth(),h=frame.getHeight();
+            ArrayList<Rect> rectangles=new ArrayList<>();
+            for(OfflinePlateDetector.Hit hit:hits)rectangles.add(hit.rect);
+            main.post(()->{
+                if(aiMode!=requestedMode)return;
+                overlay.updateMany(rectangles,Color.YELLOW,w,h);
+                status.setText(requestedMode==1?"YOLO · "+hits.size()+" номерів (без OCR)":
+                    "YOLO + OCR · "+hits.size()+" номерів");
+            });
+            if(requestedMode==2&&!hits.isEmpty()){
+                AtomicInteger remaining=new AtomicInteger(hits.size());
+                ArrayList<Rect> updated=new ArrayList<>(rectangles);
+                // Each detected plate is read separately; no arbitrary sky or road OCR.
+                for(int index=0;index<hits.size();index++){
+                    OfflinePlateDetector.Hit hit=hits.get(index);
+                    int pad=Math.max(4,hit.rect.height()/5);
+                    Rect cropRect=new Rect(Math.max(0,hit.rect.left-pad),Math.max(0,hit.rect.top-pad),
+                        Math.min(w,hit.rect.right+pad),Math.min(h,hit.rect.bottom+pad));
+                    if(cropRect.width()<8||cropRect.height()<5){
+                        remaining.decrementAndGet();continue;
+                    }
+                    Bitmap crop=Bitmap.createBitmap(frame,cropRect.left,cropRect.top,cropRect.width(),cropRect.height());
+                    int boxIndex=index;
+                    recognizer.process(InputImage.fromBitmap(crop,0)).addOnSuccessListener(text->{
+                        String candidate="";
+                        for(Text.TextBlock block:text.getTextBlocks()){
+                            for(Text.Line line:block.getLines()){
+                                String normalized=normalize(line.getText());
+                                if(normalized.length()>candidate.length()&&normalized.length()<=12)
+                                    candidate=normalized;
+                            }
+                        }
+                        String plate=candidate;
+                        boolean valid=plate.length()>=5&&plate.length()<=12&&countDigits(plate)>=2;
+                        if(valid){
+                            main.post(()->{
+                                if(aiMode!=2)return;
+                                updated.set(boxIndex,hit.rect);
+                                overlay.updateMany(updated,fullPlate.matcher(plate).matches()?Color.GREEN:Color.YELLOW,w,h);
+                                status.setText("YOLO + OCR · "+hits.size()+" об'єктів\\n"+plate);
+                                long now=System.currentTimeMillis();
+                                Long old=recent.get(plate);
+                                if(!saving&&(old==null||now-old>30000)){
+                                    recent.put(plate,now);
+                                    savePhoto(plate,fullPlate.matcher(plate).matches()?Color.GREEN:Color.YELLOW);
+                                }
+                            });
+                        }
+                    }).addOnFailureListener(error->
+                        android.util.Log.e("ANPR_AI","Crop OCR failure",error))
+                      .addOnCompleteListener(task->{
+                          crop.recycle();
+                          if(remaining.decrementAndGet()==0){frame.recycle();processing=false;}
+                      });
+                }
+                if(remaining.get()==0){frame.recycle();processing=false;}
+            }else{frame.recycle();processing=false;}
+        }catch(Exception ex){
+            android.util.Log.e("ANPR_AI","Detection failed",ex);
+            frame.recycle();processing=false;
+        }
     }
     private String normalize(String text){
         return text.toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9]","");
@@ -252,7 +405,7 @@ public class MainActivity extends ComponentActivity {
                 edited.compress(Bitmap.CompressFormat.JPEG,97,out);
             }
             BitmapFactory.Options small=new BitmapFactory.Options();
-            small.inSampleSize=4;
+            small.inSampleSize=2;
             Bitmap still=BitmapFactory.decodeFile(marked.getAbsolutePath(),small);
             if(still!=null)main.post(()->{
                 snapshot.setImageBitmap(still);snapshot.setVisibility(View.VISIBLE);
@@ -268,7 +421,7 @@ public class MainActivity extends ComponentActivity {
         }
     }
     @Override public void onDestroy(){
-        recognizer.close();io.shutdown();super.onDestroy();
+        recognizer.close();if(detector!=null)detector.close();io.shutdown();super.onDestroy();
     }
     private final class BoxOverlay extends View{
         private final Paint border=new Paint(3);
@@ -277,16 +430,26 @@ public class MainActivity extends ComponentActivity {
         private int shade=Color.GREEN;
         private int sourceWidth=1,sourceHeight=1;
         BoxOverlay(){super(MainActivity.this);border.setStyle(Paint.Style.STROKE);border.setStrokeWidth(7);label.setTextSize(34);label.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);}
-        void update(Rect r,int c,int w,int h){box=r;shade=c;sourceWidth=Math.max(1,w);sourceHeight=Math.max(1,h);invalidate();}
+        private List<Rect> many=new ArrayList<>();
+        void update(Rect r,int c,int w,int h){box=r;many.clear();shade=c;sourceWidth=Math.max(1,w);sourceHeight=Math.max(1,h);invalidate();}
+        void updateMany(List<Rect> r,int c,int w,int h){
+            box=null;many=new ArrayList<>(r);shade=c;sourceWidth=Math.max(1,w);sourceHeight=Math.max(1,h);invalidate();
+        }
         @Override protected void onDraw(Canvas c){
             super.onDraw(c);
-            if(box==null)return;
-            // InputImage coordinates are rotation-adjusted. PreviewView uses FILL_CENTER.
+            if(box==null&&many.isEmpty())return;
+            // PreviewView FIT_CENTER; account for letterbox offsets.
             float scale=Math.min(getWidth()/(float)sourceWidth,getHeight()/(float)sourceHeight);
             float dx=(getWidth()-sourceWidth*scale)/2f,dy=(getHeight()-sourceHeight*scale)/2f;
-            RectF b=new RectF(dx+box.left*scale,dy+box.top*scale,dx+box.right*scale,dy+box.bottom*scale);
-            border.setColor(shade);c.drawRoundRect(b,9,9,border);
-            label.setColor(shade);c.drawText(shade==Color.GREEN?"РОЗПІЗНАНО":shade==Color.YELLOW?"ЧАСТКОВО":"НЕЧІТКО",Math.max(10,b.left),Math.max(42,b.top-12),label);
+            List<Rect> boxes=many.isEmpty()?java.util.Collections.singletonList(box):many;
+            for(Rect r:boxes){
+                if(r==null)continue;
+                RectF b=new RectF(dx+r.left*scale,dy+r.top*scale,dx+r.right*scale,dy+r.bottom*scale);
+                border.setColor(shade);c.drawRoundRect(b,9,9,border);
+                label.setColor(shade);
+                c.drawText(shade==Color.GREEN?"РОЗПІЗНАНО":shade==Color.YELLOW?"НОМЕР":"НЕЧІТКО",
+                    Math.max(10,b.left),Math.max(42,b.top-12),label);
+            }
         }
     }
 }
