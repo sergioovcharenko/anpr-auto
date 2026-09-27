@@ -284,20 +284,6 @@ public class MainActivity extends ComponentActivity {
         if(!folder.exists()&&!folder.mkdirs()){saving=false;return;}
         String stamp=new SimpleDateFormat("yyyyMMdd_HHmmss_SSS",Locale.ROOT).format(new Date());
         File target=new File(folder,stamp+"_"+plate+".jpg");
-        Bitmap frame=preview.getBitmap();
-        if(frame!=null){
-            Bitmap shot=frame.copy(Bitmap.Config.ARGB_8888,true);
-            Canvas shotCanvas=new Canvas(shot);
-            Paint platePaint=new Paint(3);
-            platePaint.setColor(tint);
-            platePaint.setTextSize(Math.max(36f,shot.getWidth()/24f));
-            platePaint.setTypeface(Typeface.DEFAULT_BOLD);
-            platePaint.setShadowLayer(4,1,1,Color.BLACK);
-            shotCanvas.drawText("● ФОТО: "+plate,24,Math.max(70,shot.getHeight()/12f),platePaint);
-            snapshot.setImageBitmap(shot);
-            snapshot.setVisibility(View.VISIBLE);
-            main.postDelayed(()->{snapshot.setVisibility(View.GONE);snapshot.setImageDrawable(null);},1000);
-        }
         imageCapture.takePicture(new ImageCapture.OutputFileOptions.Builder(target).build(),
             io,new ImageCapture.OnImageSavedCallback(){
                 @Override public void onImageSaved(@NonNull ImageCapture.OutputFileResults output){
@@ -310,25 +296,60 @@ public class MainActivity extends ComponentActivity {
                 }
             });
     }
-    /** Overlay the recorded number on the original full-resolution image, not the low-res camera preview. */
+    /** Preserve raw full-resolution JPEG and draw the rectangle on a separately saved corrected image. */
     private void annotatePhoto(File target,String plate,int tint){
-        try{
-            android.graphics.BitmapFactory.Options options=new android.graphics.BitmapFactory.Options();
-            options.inPreferredConfig=Bitmap.Config.ARGB_8888;
-            Bitmap source=BitmapFactory.decodeFile(target.getAbsolutePath(),options);
-            if(source==null)return;
-            Bitmap edited=source.copy(Bitmap.Config.ARGB_8888,true);
-            Canvas c=new Canvas(edited);
-            float scale=Math.max(1f,edited.getWidth()/1080f);
-            Paint background=new Paint(3);background.setColor(0xD9000000);
-            c.drawRoundRect(new RectF(24*scale,24*scale,Math.min(edited.getWidth()-12*scale,770*scale),135*scale),12*scale,12*scale,background);
-            Paint text=new Paint(3);text.setColor(tint);text.setTypeface(Typeface.DEFAULT_BOLD);text.setTextSize(48*scale);
-            c.drawText("● "+plate,45*scale,94*scale,text);
-            try(java.io.FileOutputStream stream=new java.io.FileOutputStream(target)){
-                edited.compress(Bitmap.CompressFormat.JPEG,98,stream);
+        Bitmap source=null,rotated=null,edited=null;
+        try {
+            File original=new File(target.getParentFile(),target.getName().replace(".jpg","-original.jpg"));
+            try(java.io.InputStream in=new java.io.FileInputStream(target);
+                java.io.OutputStream out=new java.io.FileOutputStream(original)){
+                byte[] buffer=new byte[65536];int n;
+                while((n=in.read(buffer))!=-1)out.write(buffer,0,n);
             }
-            source.recycle();edited.recycle();
-        }catch(Exception e){android.util.Log.w("ANPR","Photo label failed",e);}
+            int orientation=new ExifInterface(original.getAbsolutePath()).getAttributeInt(
+                ExifInterface.TAG_ORIENTATION,ExifInterface.ORIENTATION_NORMAL);
+            source=BitmapFactory.decodeFile(original.getAbsolutePath());
+            if(source==null)return;
+            Matrix matrix=new Matrix();
+            if(orientation==ExifInterface.ORIENTATION_ROTATE_90)matrix.postRotate(90);
+            else if(orientation==ExifInterface.ORIENTATION_ROTATE_180)matrix.postRotate(180);
+            else if(orientation==ExifInterface.ORIENTATION_ROTATE_270)matrix.postRotate(270);
+            if(orientation!=ExifInterface.ORIENTATION_NORMAL){
+                rotated=Bitmap.createBitmap(source,0,0,source.getWidth(),source.getHeight(),matrix,true);
+            } else rotated=source;
+            edited=rotated.copy(Bitmap.Config.ARGB_8888,true);
+            Canvas c=new Canvas(edited);
+            Rect plateBox=detector!=null?detector.detect(edited):null;
+            float scale=Math.max(1,edited.getWidth()/1100f);
+            Paint pen=new Paint(3);
+            pen.setColor(tint);
+            pen.setStyle(Paint.Style.STROKE);
+            pen.setStrokeWidth(6*scale);
+            if(plateBox!=null)c.drawRoundRect(new RectF(plateBox),9*scale,9*scale,pen);
+            pen.setStyle(Paint.Style.FILL);
+            Paint panel=new Paint(3);panel.setColor(0xDF061420);
+            float labelWidth=Math.min(edited.getWidth()-20*scale,760*scale);
+            float y=plateBox==null?24*scale:Math.max(24*scale,plateBox.top-110*scale);
+            c.drawRoundRect(new RectF(24*scale,y,labelWidth,y+100*scale),12*scale,12*scale,panel);
+            pen.setTypeface(Typeface.DEFAULT_BOLD);pen.setTextSize(45*scale);
+            c.drawText("● "+plate,45*scale,y+67*scale,pen);
+            try(java.io.FileOutputStream stream=new java.io.FileOutputStream(target)){
+                edited.compress(Bitmap.CompressFormat.JPEG,96,stream);
+            }
+            Bitmap display=BitmapFactory.decodeFile(target.getAbsolutePath(),new BitmapFactory.Options(){{
+                inSampleSize=2;
+            }});
+            if(display!=null)main.post(()->{
+                snapshot.setImageBitmap(display);
+                snapshot.setVisibility(View.VISIBLE);
+                main.postDelayed(()->{snapshot.setVisibility(View.GONE);snapshot.setImageDrawable(null);display.recycle();},1000);
+            });
+        }catch(Exception e){android.util.Log.w("ANPR","Photo annotation failed",e);}
+        finally {
+            if(edited!=null&&!edited.isRecycled())edited.recycle();
+            if(rotated!=null&&rotated!=source&&!rotated.isRecycled())rotated.recycle();
+            if(source!=null&&!source.isRecycled())source.recycle();
+        }
     }
     @Override public void onDestroy(){
         if(detector!=null)detector.close();
