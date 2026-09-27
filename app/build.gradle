@@ -1,6 +1,6 @@
 plugins { id 'com.android.application' }
 android { namespace 'ua.anprauto'; compileSdk 35
- defaultConfig { applicationId 'ua.anprauto'; minSdk 26; targetSdk 35; versionCode 3; versionName '0.3-offline-preview' }
+ defaultConfig { applicationId 'ua.anprauto'; minSdk 26; targetSdk 35; versionCode 4; versionName '0.4-local-yolo' }
  compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
 }
 dependencies {
@@ -11,4 +11,6 @@ dependencies {
  implementation 'androidx.camera:camera-view:1.4.2'
  implementation 'androidx.lifecycle:lifecycle-runtime:2.8.7'
  implementation 'com.google.mlkit:text-recognition:16.0.1'
+ implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.20.0'
+ implementation 'androidx.exifinterface:exifinterface:1.3.7'
 }
